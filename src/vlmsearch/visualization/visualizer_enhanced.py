@@ -1106,15 +1106,6 @@ def generate_html_file(tree_data, graph_data, stats, output_filename):
         }});
 
         // Network events
-        network.on("hoverNode", ({{node}}) => {{
-            const data = interactiveDataMap[node];
-            drawHighlight(data?.coords);
-        }});
-        
-        network.on("blurNode", () => {{
-            ctx.clearRect(0, 0, highlightCanvas.width, highlightCanvas.height);
-        }});
-        
         network.on("click", ({{nodes}}) => {{
             if (!nodes.length) return;
             
