@@ -418,12 +418,13 @@ def encode_image_to_base64(image_path):
         print(f"Error: Could not encode image {image_path}: {e}")
         return None
 
-def generate_html_file(tree_data, graph_data, stats, output_filename):
+def generate_html_file(tree_data, graph_data, stats, output_filename, debug_mode=False):
     """Generates the final self-contained HTML file."""
 
     nodes_json = json.dumps(graph_data['nodes'])
     edges_json = json.dumps(graph_data['edges'])
     interactive_data_json = json.dumps(graph_data['interactive_data'])
+    debug_mode_json = json.dumps(debug_mode)
 
     # Format stats for display
     success_rate_0 = (stats['successful_rollouts_0'] / stats['total_rollouts'] * 100) if stats['total_rollouts'] > 0 else 0
@@ -536,6 +537,20 @@ def generate_html_file(tree_data, graph_data, stats, output_filename):
         .url-image-fallback {{ background-color: #e9ecef; border: 2px dashed #6c757d; padding: 20px; text-align: center; border-radius: 5px; margin-top: 10px; }}
         .url-image-fallback a {{ color: #007bff; text-decoration: none; font-weight: bold; }}
         .url-image-fallback a:hover {{ text-decoration: underline; }}
+        
+        /* Debug coordinate display */
+        #debug-coords {{ 
+            position: fixed; 
+            background-color: rgba(0, 0, 0, 0.8); 
+            color: white; 
+            padding: 5px 10px; 
+            border-radius: 5px; 
+            font-family: monospace; 
+            font-size: 12px; 
+            pointer-events: none; 
+            z-index: 1000; 
+            display: none;
+        }}
         
         /* Tab 4: Node output */
         .output-container {{ padding: 20px; overflow-y: auto; flex: 1; }}
@@ -654,6 +669,9 @@ def generate_html_file(tree_data, graph_data, stats, output_filename):
         </div>
     </div>
 
+    <!-- Debug coordinates display -->
+    <div id="debug-coords"></div>
+
     <!-- Rollout Modal -->
     <div id="rollout-modal" class="modal">
         <div class="modal-content">
@@ -686,6 +704,7 @@ def generate_html_file(tree_data, graph_data, stats, output_filename):
         const nodesData = {nodes_json};
         const edgesData = {edges_json};
         const interactiveDataMap = {interactive_data_json};
+        const debugMode = {debug_mode_json};
 
         // --- State Variables ---
         let currentSelectedNode = null;
@@ -703,6 +722,7 @@ def generate_html_file(tree_data, graph_data, stats, output_filename):
         const ctx = highlightCanvas.getContext('2d');
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('file-input');
+        const debugCoordsDiv = document.getElementById('debug-coords');
         
         // Tab elements
         const tabs = document.querySelectorAll('.tab');
@@ -1039,6 +1059,35 @@ def generate_html_file(tree_data, graph_data, stats, output_filename):
             }}
         }}
 
+        function showDebugCoords(clientX, clientY) {{
+            if (!debugMode || !taskImage.complete || taskImage.naturalWidth === 0) {{
+                debugCoordsDiv.style.display = 'none';
+                return;
+            }}
+
+            // Calculate the image coordinates relative to the original image
+            const rect = imageContainer.getBoundingClientRect();
+            const containerX = clientX - rect.left;
+            const containerY = clientY - rect.top;
+            
+            // Convert container coordinates to image coordinates accounting for pan and scale
+            const imageX = (containerX - panX) / scale;
+            const imageY = (containerY - panY) / scale;
+            
+            // Ensure coordinates are within image bounds
+            if (imageX >= 0 && imageX <= taskImage.naturalWidth && imageY >= 0 && imageY <= taskImage.naturalHeight) {{
+                const roundedX = Math.round(imageX);
+                const roundedY = Math.round(imageY);
+                
+                debugCoordsDiv.textContent = `(${{roundedX}}, ${{roundedY}})`;
+                debugCoordsDiv.style.left = (clientX + 10) + 'px';
+                debugCoordsDiv.style.top = (clientY - 30) + 'px';
+                debugCoordsDiv.style.display = 'block';
+            }} else {{
+                debugCoordsDiv.style.display = 'none';
+            }}
+        }}
+
         // --- Event Listeners ---
         
         // Panel toggle
@@ -1091,10 +1140,13 @@ def generate_html_file(tree_data, graph_data, stats, output_filename):
             imageContainer.style.cursor = 'grabbing';
         }});
         imageContainer.addEventListener('mousemove', (e) => {{
-            if (!isPanning) return;
-            panX = e.clientX - startPan.x;
-            panY = e.clientY - startPan.y;
-            updateImageTransform();
+            if (isPanning) {{
+                panX = e.clientX - startPan.x;
+                panY = e.clientY - startPan.y;
+                updateImageTransform();
+            }}
+            // Show debug coordinates regardless of panning state
+            showDebugCoords(e.clientX, e.clientY);
         }});
         imageContainer.addEventListener('mouseup', () => {{
             isPanning = false;
@@ -1103,6 +1155,7 @@ def generate_html_file(tree_data, graph_data, stats, output_filename):
         imageContainer.addEventListener('mouseleave', () => {{
             isPanning = false;
             imageContainer.style.cursor = 'grab';
+            debugCoordsDiv.style.display = 'none';
         }});
 
         // Network events
@@ -1193,6 +1246,7 @@ def main():
     parser.add_argument('input_file', type=str, help='Path to the MCTS rollout JSONL file.')
     parser.add_argument('--output_filename', type=str, default='mcts_visualization_enhanced', help='Name of the output file (without extension).')
     parser.add_argument('--max_depth', type=int, default=None, help='Maximum depth of the tree to visualize.')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode to show coordinates on hover.')
     
     args = parser.parse_args()
 
@@ -1216,7 +1270,7 @@ def main():
     print(f"Processed {len(graph_data['nodes'])} nodes and {len(graph_data['edges'])} edges for the graph.")
 
     # 3. Generate the final HTML file
-    generate_html_file(rollout_data, graph_data, stats, args.output_filename)
+    generate_html_file(rollout_data, graph_data, stats, args.output_filename, args.debug)
     print(f"✅ Enhanced interactive visualization v{VERSION} saved to {os.path.abspath(args.output_filename)}.html")
 
 if __name__ == '__main__':
