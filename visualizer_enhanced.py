@@ -298,26 +298,26 @@ def resolve_image_path(original_image_path, images_config):
     return resolved_path
 
 def _extract_coords(text):
-    """Extracts all (x, y) coordinates from a string, supporting integers and floats."""
+    """Extracts all (x, y) and [x, y] coordinates from a string, supporting integers and floats."""
     if not isinstance(text, str):
         return []
-    
-    # This pattern supports floats and is from the original visualizer
-    pattern = r'\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\)'
+
+    # Pattern supports both parentheses (x, y) and square brackets [x, y]
+    pattern = r'[\(\[]\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*[\)\]]'
     matches = re.findall(pattern, text)
-    
+
     coords_list = []
     for match in matches:
         try:
-            # match is a tuple of strings, e.g., ('123.4', '.4', '567', '')
+            # match is a tuple of strings, e.g., ('123.4', '567.8')
             # The actual numbers are in group 1 and 2 of the regex, which correspond to match[0] and match[1]
             x, y = float(match[0]), float(match[1])
-            
+
             if 0 <= x <= 10000 and 0 <= y <= 10000:
                 coords_list.append([x, y])
         except (ValueError, IndexError):
             continue
-    
+
     return coords_list
 
 def extract_examples_from_system_prompt(system_prompt):
@@ -374,9 +374,64 @@ def extract_examples_from_system_prompt(system_prompt):
     
     return examples
 
+def extract_items_from_system_prompt(system_prompt):
+    """Extract items from the system prompt text using the correct format."""
+    items = []
+    lines = system_prompt.split('\n')
+
+    current_item = None
+    current_item_text = []
+    in_item = False
+
+    for line in lines:
+        line_stripped = line.strip()
+        if line_stripped.startswith('--- Item') and line_stripped.endswith('---'):
+            # Start of a new item
+            if current_item is not None:
+                # Save the previous item
+                current_item['text'] = '\n'.join(current_item_text).strip()
+                items.append(current_item)
+
+            # Start new item
+            current_item = {
+                'title': line_stripped,
+                'text': '',
+                'image_path': None
+            }
+            current_item_text = []
+            in_item = True
+        elif line_stripped.startswith('--- End Item') and line_stripped.endswith('---'):
+            # End of item
+            if current_item is not None:
+                current_item['text'] = '\n'.join(current_item_text).strip()
+                items.append(current_item)
+            current_item = None
+            current_item_text = []
+            in_item = False
+        elif in_item and current_item is not None:
+            # Collect item text, look for image paths
+            current_item_text.append(line)
+            # Check if this line contains an image path
+            if 'url:' in line and ('.jpg' in line or '.png' in line or '.jpeg' in line or '.gif' in line):
+                # Extract image path from URL
+                url_start = line.find('url:') + 4
+                url_part = line[url_start:].strip()
+                # Remove any trailing characters like ]
+                if url_part.endswith(']'):
+                    url_part = url_part[:-1].strip()
+                current_item['image_path'] = url_part
+
+    # Handle the last item if no end marker
+    if current_item is not None:
+        current_item['text'] = '\n'.join(current_item_text).strip()
+        items.append(current_item)
+
+    return items
+
 def get_tree_statistics(tree_data):
-    """Recursively traverse the tree to compute overall statistics."""
+    """Recursively traverse the tree to compute comprehensive tree search performance statistics."""
     stats = {
+        # Original metrics
         'total_nodes': 0,
         'max_depth': 0,
         'terminal_nodes': 0,
@@ -390,19 +445,81 @@ def get_tree_statistics(tree_data):
         'action_distribution': {},
         'best_reward': -1.0,
         'best_reward_node_count': 0,
+
+        # New key performance metrics
+        'tree_success': 0,  # Binary: 1 if tree has any perfect rollout, 0 otherwise
+        'tree_has_any_success': 0,  # Binary: 1 if tree has any positive rollout, 0 otherwise
+        'tree_has_good_success': 0,  # Binary: 1 if tree has any rollout >= 0.5, 0 otherwise
+
+        # Early success metrics
+        'depth_to_first_success': float('inf'),  # Depth where first perfect rollout was found
+        'rollouts_to_first_success': float('inf'),  # Number of rollouts before first perfect success
+        'nodes_to_first_success': float('inf'),  # Number of nodes explored before first perfect success
+
+        # Search efficiency metrics
+        'perfect_success_density': 0,  # Perfect rollouts per node
+        'search_efficiency_score': 0,  # Weighted score: perfect_rollouts / (nodes * depth)
+        'exploration_to_exploitation_ratio': 0,  # Unique nodes vs total rollouts ratio
+
+        # Tree quality metrics
+        'branching_factor': 0,  # Average number of children per non-terminal node
+        'depth_distribution_variance': 0,  # How varied the tree depths are
+        'visit_concentration': 0,  # How concentrated visits are (Gini coefficient style)
+        'terminal_success_rate': 0,  # Fraction of terminal nodes with perfect rollouts
+
+        # Advanced search metrics
+        'successful_paths': 0,  # Number of root-to-leaf paths with perfect rollouts
+        'unique_states_explored': 0,  # Estimated unique states (using thought text as proxy)
+        'rollout_efficiency': 0,  # successful_rollouts_1 / total_rollouts
+        'node_efficiency': 0,  # successful_rollouts_1 / total_nodes
     }
-    
+
     if 'tree' not in tree_data:
         return stats
 
     root = tree_data['tree']
 
-    def _recursive_stats(node, depth):
+    # Track additional state for new metrics
+    depth_counts = {}  # depth -> count of nodes at that depth
+    visit_counts = []  # List of all visit counts for concentration calculation
+    non_terminal_nodes = 0
+    total_children = 0
+    unique_thoughts = set()
+    terminal_nodes_with_success = 0
+    successful_path_count = 0
+    rollouts_processed = 0
+    first_success_found = False
+
+    def _recursive_stats(node, depth, path_has_success=False):
+        nonlocal rollouts_processed, first_success_found, non_terminal_nodes, total_children
+        nonlocal terminal_nodes_with_success, successful_path_count
+
         if not node:
-            return
+            return path_has_success
 
         stats['total_nodes'] += 1
         stats['max_depth'] = max(stats['max_depth'], depth)
+
+        # Track depth distribution
+        depth_counts[depth] = depth_counts.get(depth, 0) + 1
+
+        # Track visit counts for concentration analysis
+        visit_count = node.get('visit_count', 0)
+        visit_counts.append(visit_count)
+
+        # Track unique thoughts (proxy for unique states)
+        thought = node.get('thought_text', '')
+        if thought:
+            unique_thoughts.add(thought)
+
+        # Track branching factor
+        children = node.get('children', [])
+        num_children = len(children)
+        if num_children > 0:
+            non_terminal_nodes += 1
+            total_children += num_children
+
+        node_has_perfect_success = False
 
         if node.get('is_terminal'):
             stats['terminal_nodes'] += 1
@@ -410,6 +527,10 @@ def get_tree_statistics(tree_data):
                 rewards = [r.get('reward', -1.0) for r in node['rollouts']]
                 if rewards:
                     max_reward_in_node = max(rewards)
+                    if max_reward_in_node == 1.0:
+                        terminal_nodes_with_success += 1
+                        node_has_perfect_success = True
+
                     if max_reward_in_node > stats['best_reward']:
                         stats['best_reward'] = max_reward_in_node
                         stats['best_reward_node_count'] = 1
@@ -423,8 +544,11 @@ def get_tree_statistics(tree_data):
         if 'rollouts' in node:
             num_rollouts = len(node['rollouts'])
             stats['total_rollouts'] += num_rollouts
+
             for rollout in node['rollouts']:
+                rollouts_processed += 1
                 reward = rollout.get('reward', 0)
+
                 if reward > 0:
                     stats['successful_rollouts_0'] += 1
                 if reward >= 0.5:
@@ -433,14 +557,95 @@ def get_tree_statistics(tree_data):
                     stats['successful_rollouts_075'] += 1
                 if reward == 1:
                     stats['successful_rollouts_1'] += 1
+                    node_has_perfect_success = True
+
+                    # Track early success metrics (only for first success)
+                    if not first_success_found:
+                        stats['depth_to_first_success'] = depth
+                        stats['rollouts_to_first_success'] = rollouts_processed
+                        stats['nodes_to_first_success'] = stats['total_nodes']
+                        first_success_found = True
+
                 if 'final_answer' in rollout:
                     action = rollout['final_answer']
                     stats['action_distribution'][action] = stats['action_distribution'].get(action, 0) + 1
-        
-        for child in node.get('children', []):
-            _recursive_stats(child, depth + 1)
+
+        # Recursively process children and track successful paths
+        current_path_has_success = path_has_success or node_has_perfect_success
+        child_paths_with_success = 0
+
+        for child in children:
+            child_has_success = _recursive_stats(child, depth + 1, current_path_has_success)
+            if child_has_success:
+                child_paths_with_success += 1
+
+        # If this is a terminal node with success, count the path
+        if node.get('is_terminal') and current_path_has_success:
+            successful_path_count += 1
+
+        return current_path_has_success
 
     _recursive_stats(root, 0)
+
+    # Calculate derived metrics
+    stats['tree_success'] = 1 if stats['successful_rollouts_1'] > 0 else 0
+    stats['tree_has_any_success'] = 1 if stats['successful_rollouts_0'] > 0 else 0
+    stats['tree_has_good_success'] = 1 if stats['successful_rollouts_05'] > 0 else 0
+
+    # Handle infinity values for early success metrics
+    if not first_success_found:
+        stats['depth_to_first_success'] = -1
+        stats['rollouts_to_first_success'] = -1
+        stats['nodes_to_first_success'] = -1
+
+    # Calculate efficiency metrics
+    if stats['total_nodes'] > 0:
+        stats['perfect_success_density'] = stats['successful_rollouts_1'] / stats['total_nodes']
+        stats['node_efficiency'] = stats['successful_rollouts_1'] / stats['total_nodes']
+        stats['unique_states_explored'] = len(unique_thoughts)
+
+        if stats['max_depth'] > 0:
+            stats['search_efficiency_score'] = stats['successful_rollouts_1'] / (stats['total_nodes'] * stats['max_depth'])
+
+        if stats['total_rollouts'] > 0:
+            stats['exploration_to_exploitation_ratio'] = stats['total_nodes'] / stats['total_rollouts']
+
+    if stats['total_rollouts'] > 0:
+        stats['rollout_efficiency'] = stats['successful_rollouts_1'] / stats['total_rollouts']
+
+    # Calculate branching factor
+    if non_terminal_nodes > 0:
+        stats['branching_factor'] = total_children / non_terminal_nodes
+
+    # Calculate depth distribution variance
+    if depth_counts:
+        depths = list(depth_counts.keys())
+        counts = list(depth_counts.values())
+        total_nodes_check = sum(counts)
+        if total_nodes_check > 1:
+            mean_depth = sum(d * c for d, c in zip(depths, counts)) / total_nodes_check
+            variance = sum(c * (d - mean_depth) ** 2 for d, c in zip(depths, counts)) / total_nodes_check
+            stats['depth_distribution_variance'] = variance
+
+    # Calculate visit concentration (Gini coefficient approximation)
+    if len(visit_counts) > 1:
+        visit_counts_sorted = sorted(visit_counts)
+        n = len(visit_counts_sorted)
+        total_visits = sum(visit_counts_sorted)
+        if total_visits > 0:
+            cumulative_sum = 0
+            gini_sum = 0
+            for i, visits in enumerate(visit_counts_sorted):
+                cumulative_sum += visits
+                gini_sum += (2 * (i + 1) - n - 1) * visits
+            stats['visit_concentration'] = gini_sum / (n * total_visits)
+
+    # Calculate terminal success rate
+    if stats['terminal_nodes'] > 0:
+        stats['terminal_success_rate'] = terminal_nodes_with_success / stats['terminal_nodes']
+
+    stats['successful_paths'] = successful_path_count
+
     return stats
 
 
@@ -518,25 +723,21 @@ def build_graph_data(tree_data, max_depth_vis):
         
         # Extract retrieved examples from prompt_for_node using the correct format
         retrieved_examples = []
-        seen_examples = set()  # Track unique examples to avoid duplicates
-        
-        # First, check if prompt_for_node contains examples or strategies
-        if prompt_for_node and ("--- Example" in prompt_for_node or "--- Strategy" in prompt_for_node):
+
+        # First, check if prompt_for_node contains examples, strategies, or items
+        if prompt_for_node and ("--- Example" in prompt_for_node or "--- Strategy" in prompt_for_node or "--- Item" in prompt_for_node):
             if "--- Example" in prompt_for_node:
                 parsed_examples = extract_examples_from_system_prompt(prompt_for_node)
                 for example in parsed_examples:
-                    unique_key = f"{example['title']}:::{example['text'][:100]}"
-                    if unique_key not in seen_examples:
-                        retrieved_examples.append({
-                            'image_path': example.get('image_path'),
-                            'encoded_image': encode_image_to_base64(example.get('image_path')) if example.get('image_path') else None,
-                            'text': example['text'],
-                            'title': example['title'],
-                            'example_index': len(retrieved_examples),
-                            'source': 'prompt_for_node'
-                        })
-                        seen_examples.add(unique_key)
-            
+                    retrieved_examples.append({
+                        'image_path': example.get('image_path'),
+                        'encoded_image': encode_image_to_base64(example.get('image_path')) if example.get('image_path') else None,
+                        'text': example['text'],
+                        'title': example['title'],
+                        'example_index': len(retrieved_examples),
+                        'source': 'prompt_for_node'
+                    })
+
             # Handle strategies in abstractions format
             if "--- Strategy" in prompt_for_node:
                 strategy_sections = []
@@ -545,52 +746,63 @@ def build_graph_data(tree_data, max_depth_vis):
                     if "--- End Strategy" in part:
                         strategy_content = f"--- Strategy{part.split('--- End Strategy')[0]}--- End Strategy {i} ---"
                         strategy_sections.append(strategy_content.strip())
-                
+
                 for j, strategy in enumerate(strategy_sections):
-                    unique_key = f"strategy_{j}:::{strategy[:100]}"
-                    if unique_key not in seen_examples:
-                        retrieved_examples.append({
-                            'image_path': None,
-                            'encoded_image': None,
-                            'text': strategy,
-                            'title': f'Retrieved Strategy {len(retrieved_examples) + 1}',
-                            'example_index': len(retrieved_examples),
-                            'source': 'prompt_for_node_strategy'
-                        })
-                        seen_examples.add(unique_key)
-        
+                    retrieved_examples.append({
+                        'image_path': None,
+                        'encoded_image': None,
+                        'text': strategy,
+                        'title': f'Retrieved Strategy {len(retrieved_examples) + 1}',
+                        'example_index': len(retrieved_examples),
+                        'source': 'prompt_for_node_strategy'
+                    })
+
+            # Handle items in abstractions format
+            if "--- Item" in prompt_for_node:
+                parsed_items = extract_items_from_system_prompt(prompt_for_node)
+                for item in parsed_items:
+                    retrieved_examples.append({
+                        'image_path': item.get('image_path'),
+                        'encoded_image': encode_image_to_base64(item.get('image_path')) if item.get('image_path') else None,
+                        'text': item['text'],
+                        'title': f'Retrieved Item {len(retrieved_examples) + 1}',
+                        'example_index': len(retrieved_examples),
+                        'source': 'prompt_for_node_item'
+                    })
+
         # Also check rollouts for any additional examples (fallback)
         if node.get('rollouts'):
             for rollout_idx, rollout in enumerate(node['rollouts']):
                 # Check ephemeral_retrieved_paths and ephemeral_texts
                 ephemeral_texts = rollout.get('ephemeral_texts', [])
                 ephemeral_paths = rollout.get('ephemeral_retrieved_paths', [])
-                
+
                 if ephemeral_texts:
                     for i, text_content in enumerate(ephemeral_texts):
-                        # Check if this text contains retrieved examples/strategies
-                        if text_content and ('--- Example' in text_content or '--- Strategy' in text_content):
+                        # Check if this text contains retrieved examples/strategies/items
+                        if text_content and ('--- Example' in text_content or '--- Strategy' in text_content or '--- Item' in text_content):
                             path = ephemeral_paths[i] if i < len(ephemeral_paths) else None
                             # Handle both cases: with path (regular) and without path (abstractions)
                             if path and path.strip():
-                                unique_key = f"{path}:::{text_content[:100]}"
                                 title = f'Retrieved Example {len(retrieved_examples) + 1}'
                             else:
                                 # Abstractions format or text-only examples
-                                unique_key = f"text_only_{i}:::{text_content[:100]}"
-                                title = f'Retrieved Strategy {len(retrieved_examples) + 1}' if '--- Strategy' in text_content else f'Retrieved Example {len(retrieved_examples) + 1}'
-                            
-                            if unique_key not in seen_examples:
-                                retrieved_examples.append({
-                                    'image_path': path,
-                                    'encoded_image': encode_image_to_base64(path) if path else None,
-                                    'text': text_content,
-                                    'title': title,
-                                    'example_index': i,
-                                    'rollout_index': rollout_idx,
-                                    'source': 'ephemeral_paths'
-                                })
-                                seen_examples.add(unique_key)
+                                if '--- Strategy' in text_content:
+                                    title = f'Retrieved Strategy {len(retrieved_examples) + 1}'
+                                elif '--- Item' in text_content:
+                                    title = f'Retrieved Item {len(retrieved_examples) + 1}'
+                                else:
+                                    title = f'Retrieved Example {len(retrieved_examples) + 1}'
+
+                            retrieved_examples.append({
+                                'image_path': path,
+                                'encoded_image': encode_image_to_base64(path) if path else None,
+                                'text': text_content,
+                                'title': title,
+                                'example_index': i,
+                                'rollout_index': rollout_idx,
+                                'source': 'ephemeral_paths'
+                            })
         
         interactive_data_map[current_id] = {
             "type": "node_prompt", 
