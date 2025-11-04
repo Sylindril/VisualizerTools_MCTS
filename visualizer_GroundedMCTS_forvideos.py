@@ -197,7 +197,12 @@ import mimetypes
 from copy import deepcopy
 from pathlib import Path
 
-from utils.vis_utils import vis_all
+try:
+    from utils.vis_utils import vis_all
+    HAS_VIS_UTILS = True
+except ImportError:
+    HAS_VIS_UTILS = False
+    print("Warning: utils.vis_utils not found. Visualization features will be limited.")
 
 
 skill_map = {
@@ -311,24 +316,73 @@ def _extract_coords(text):
     """Extracts all (x, y) coordinates from a string, supporting integers and floats."""
     if not isinstance(text, str):
         return []
-    
+
     # This pattern supports floats and is from the original visualizer
     pattern = r'\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\)'
     matches = re.findall(pattern, text)
-    
+
     coords_list = []
     for match in matches:
         try:
             # match is a tuple of strings, e.g., ('123.4', '.4', '567', '')
             # The actual numbers are in group 1 and 2 of the regex, which correspond to match[0] and match[1]
             x, y = float(match[0]), float(match[1])
-            
+
             if 0 <= x <= 10000 and 0 <= y <= 10000:
                 coords_list.append([x, y])
         except (ValueError, IndexError):
             continue
-    
+
     return coords_list
+
+def _extract_bounding_boxes(text):
+    """
+    Extracts bounding boxes from text patterns.
+    Supports multiple formats:
+    - box(x1, y1, x2, y2)
+    - bbox(x1, y1, x2, y2)
+    - [x1, y1, x2, y2]
+    - rect(x, y, width, height)
+
+    Returns list of dicts: [{"x1": x1, "y1": y1, "x2": x2, "y2": y2, "label": "..."}, ...]
+    """
+    if not isinstance(text, str):
+        return []
+
+    boxes = []
+
+    # Pattern 1: box(x1, y1, x2, y2) or bbox(x1, y1, x2, y2)
+    pattern1 = r'(?:box|bbox)\s*\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\)'
+    for match in re.finditer(pattern1, text, re.IGNORECASE):
+        try:
+            x1, y1, x2, y2 = float(match.group(1)), float(match.group(2)), float(match.group(3)), float(match.group(4))
+            if 0 <= x1 <= 10000 and 0 <= y1 <= 10000 and 0 <= x2 <= 10000 and 0 <= y2 <= 10000:
+                boxes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "label": match.group(0)})
+        except (ValueError, IndexError):
+            continue
+
+    # Pattern 2: rect(x, y, width, height)
+    pattern2 = r'rect\s*\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\)'
+    for match in re.finditer(pattern2, text, re.IGNORECASE):
+        try:
+            x, y, w, h = float(match.group(1)), float(match.group(2)), float(match.group(3)), float(match.group(4))
+            if 0 <= x <= 10000 and 0 <= y <= 10000 and w > 0 and h > 0:
+                boxes.append({"x1": x, "y1": y, "x2": x + w, "y2": y + h, "label": match.group(0)})
+        except (ValueError, IndexError):
+            continue
+
+    # Pattern 3: [x1, y1, x2, y2] (array notation)
+    pattern3 = r'\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]'
+    for match in re.finditer(pattern3, text):
+        try:
+            coords = [float(match.group(i)) for i in range(1, 5)]
+            # Check if this looks like a bounding box (not just any 4-element array)
+            if all(0 <= c <= 10000 for c in coords) and coords[2] > coords[0] and coords[3] > coords[1]:
+                boxes.append({"x1": coords[0], "y1": coords[1], "x2": coords[2], "y2": coords[3], "label": match.group(0)})
+        except (ValueError, IndexError):
+            continue
+
+    return boxes
 
 def extract_examples_from_system_prompt(system_prompt):
     """Extract examples from the system prompt text using the correct format."""
@@ -567,7 +621,28 @@ def build_graph_data(tree_data, max_depth_vis):
         
         # coords = _extract_coords(thought)
         coords = [node["point"]]
-        
+
+        # Extract video/gif path from node (support both field names)
+        video_path = node.get('video_path') or node.get('gif_path')
+
+        # Extract bounding boxes from thought text and any other relevant text fields
+        bounding_boxes = []
+        if thought:
+            bounding_boxes.extend(_extract_bounding_boxes(thought))
+
+        # Extract from node_system_prompt (useful in exhaustive mode)
+        node_system_prompt = node.get('node_system_prompt', '')
+        if node_system_prompt:
+            bounding_boxes.extend(_extract_bounding_boxes(node_system_prompt))
+
+        # Also extract from rollout outputs if available
+        if node.get('rollouts'):
+            for rollout in node['rollouts']:
+                for field in ['node_text', 'node_status', 'progress_text', 'reflection']:
+                    text = rollout.get(field, '')
+                    if text:
+                        bounding_boxes.extend(_extract_bounding_boxes(text))
+
         nodes.append({
             "id": current_id, "label": label, "shape": 'box', "color": color,
             "margin": 10, "font": {"color": "#333"}
@@ -664,13 +739,15 @@ def build_graph_data(tree_data, max_depth_vis):
         #                         seen_examples.add(unique_key)
         
         interactive_data_map[current_id] = {
-            "type": "node_prompt", 
+            "type": "node_prompt",
             "data": prompt_for_node,
             "coords": coords,
             "node_type": node_type,
             "node_data": node,
             "rollout_data": node.get('rollouts', []),
-            "retrieved_examples": retrieved_examples
+            "retrieved_examples": retrieved_examples,
+            "video_path": video_path,
+            "bounding_boxes": bounding_boxes
         }
         
         # 3. Create a SEPARATE leaf node for EACH rollout
@@ -722,8 +799,8 @@ def build_graph_data(tree_data, max_depth_vis):
             # parent_node = node["parent"]
             vis_input_image = deepcopy(parent_node["image"])
             vis_elems = {
-                "point": node["point"],
-                "box": node["box"],
+                "point": node.get("point"),
+                "box": node.get("box"),
             }
             if "mask" in node and node["mask"] is not None:
                 vis_mask = True
@@ -737,22 +814,24 @@ def build_graph_data(tree_data, max_depth_vis):
             if "goal_pose_0" in node and node["goal_pose_0"] is not None:
                 vis_goal_pose_0 = True
                 vis_elems.update({"goal_pose_0": node["goal_pose_0"]})
-            vis_result = vis_all(
-                vis_input_image, 
-                vis_elems, 
-                T=T,
-                scene_pose_matrix=scene_pose_matrix,
-                ixt=ixt,
-                ext=ext,
-                H=H,
-                W=W,
-                vis_point="point" in vis_elems and vis_elems["point"] is not None,
-                vis_box="box" in vis_elems and vis_elems["box"] is not None,
-                vis_mask=vis_mask,
-                vis_gripper=vis_goal_pose,
-                vis_gripper_0=vis_goal_pose_0
-            )
-            node["vis_result"] = vis_result
+
+            if HAS_VIS_UTILS:
+                vis_result = vis_all(
+                    vis_input_image,
+                    vis_elems,
+                    T=T,
+                    scene_pose_matrix=scene_pose_matrix,
+                    ixt=ixt,
+                    ext=ext,
+                    H=H,
+                    W=W,
+                    vis_point="point" in vis_elems and vis_elems["point"] is not None,
+                    vis_box="box" in vis_elems and vis_elems["box"] is not None,
+                    vis_mask=vis_mask,
+                    vis_gripper=vis_goal_pose,
+                    vis_gripper_0=vis_goal_pose_0
+                )
+                node["vis_result"] = vis_result
 
             vis_goal_pose_next = False
             vis_goal_pose_0_next = False
@@ -769,22 +848,24 @@ def build_graph_data(tree_data, max_depth_vis):
             # if "goal_pose_0" in node and node["goal_pose_0"] is not None:
             #     vis_goal_pose_0_next = True
             #     vis_elems_next.update({"goal_pose_0": node["goal_pose_0"]})
-            vis_result_next = vis_all(
-                vis_input_image_next, 
-                vis_elems_next, 
-                T=T,
-                scene_pose_matrix=scene_pose_matrix,
-                ixt=ixt,
-                ext=ext,
-                H=H,
-                W=W,
-                vis_point=False,
-                vis_box=False,
-                vis_mask=False,
-                vis_gripper=vis_goal_pose_next,
-                vis_gripper_0=vis_goal_pose_0_next
-            )
-            node["vis_result_next"] = vis_result_next
+
+            if HAS_VIS_UTILS:
+                vis_result_next = vis_all(
+                    vis_input_image_next,
+                    vis_elems_next,
+                    T=T,
+                    scene_pose_matrix=scene_pose_matrix,
+                    ixt=ixt,
+                    ext=ext,
+                    H=H,
+                    W=W,
+                    vis_point=False,
+                    vis_box=False,
+                    vis_mask=False,
+                    vis_gripper=vis_goal_pose_next,
+                    vis_gripper_0=vis_goal_pose_0_next
+                )
+                node["vis_result_next"] = vis_result_next
         else:
             node["vis_result"] = node["image"]
 
@@ -843,14 +924,15 @@ def encode_image_to_base64(image_path):
         return None
     
 
-def generate_html_file(tree_data, graph_data, stats, output_dir, output_filename, debug_mode=False, images_config=None):
+def generate_html_file(tree_data, graph_data, stats, output_dir, output_filename, debug_mode=False, images_config=None, exhaustive_mode=False):
     """Generates the final self-contained HTML file."""
 
     nodes_json = json.dumps(graph_data['nodes'])
     edges_json = json.dumps(graph_data['edges'])
     interactive_data_json = json.dumps(graph_data['interactive_data'])
     debug_mode_json = json.dumps(debug_mode)
-    
+    exhaustive_mode_json = json.dumps(exhaustive_mode)
+
     # Calculate display scale from images config
     display_scale = 1.0
     if images_config and images_config.get("scale"):
@@ -1143,9 +1225,13 @@ def generate_html_file(tree_data, graph_data, stats, output_dir, output_filename
                     <!-- Tab 2: Video -->
                     <div id="video-tab" class="tab-content">
                         <div id="video-container" style="padding:16px; overflow:auto;">
-                            <div id="video-box" style="max-width:100%;">
-                            <!-- We will inject a <video> element here -->
-                            <div id="video-display" class="video-display">Click on a node to load its video...</div>
+                            <div id="video-box" style="position: relative; max-width:100%; display: inline-block;">
+                                <!-- Video or GIF element will be injected here -->
+                                <video id="video-player" style="display: none; max-width: 100%; height: auto;" controls loop></video>
+                                <img id="gif-player" style="display: none; max-width: 100%; height: auto;" alt="GIF"/>
+                                <!-- Canvas overlay for bounding boxes -->
+                                <canvas id="video-overlay-canvas" style="position: absolute; top: 0; left: 0; pointer-events: none;"></canvas>
+                                <div id="video-display" class="video-display">Click on a node to load its video/GIF...</div>
                             </div>
                         </div>
                     </div>
@@ -1333,6 +1419,7 @@ def generate_html_file(tree_data, graph_data, stats, output_dir, output_filename
         const edgesData = {edges_json};
         const interactiveDataMap = {interactive_data_json};
         const debugMode = {debug_mode_json};
+        const exhaustiveMode = {exhaustive_mode_json};
         const displayScale = {display_scale_json};
 
         // --- State Variables ---
@@ -1740,10 +1827,133 @@ def generate_html_file(tree_data, graph_data, stats, output_dir, output_filename
             }}
         }}
 
+        function updateVideoDisplay(nodeData) {{
+            const videoPlayer = document.getElementById('video-player');
+            const gifPlayer = document.getElementById('gif-player');
+            const videoDisplay = document.getElementById('video-display');
+            const canvas = document.getElementById('video-overlay-canvas');
+            const ctx = canvas.getContext('2d');
+
+            // Clear previous state
+            videoPlayer.style.display = 'none';
+            gifPlayer.style.display = 'none';
+            videoDisplay.style.display = 'block';
+            videoPlayer.pause();
+            videoPlayer.src = '';
+            gifPlayer.src = '';
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (!nodeData || !nodeData.video_path) {{
+                videoDisplay.textContent = 'No video/GIF available for this node.';
+                return;
+            }}
+
+            const videoPath = nodeData.video_path;
+            const boundingBoxes = nodeData.bounding_boxes || [];
+
+            // Determine if it's a GIF or video based on file extension
+            const isGif = videoPath.toLowerCase().endsWith('.gif');
+
+            if (isGif) {{
+                // Display GIF
+                gifPlayer.onload = function() {{
+                    videoDisplay.style.display = 'none';
+                    gifPlayer.style.display = 'block';
+
+                    // Set canvas size to match GIF
+                    canvas.width = gifPlayer.offsetWidth;
+                    canvas.height = gifPlayer.offsetHeight;
+                    canvas.style.display = 'block';
+
+                    // Draw bounding boxes
+                    drawBoundingBoxes(ctx, boundingBoxes, gifPlayer.offsetWidth, gifPlayer.offsetHeight);
+                }};
+
+                gifPlayer.onerror = function() {{
+                    videoDisplay.textContent = `Failed to load GIF: ${{videoPath}}`;
+                    videoDisplay.style.display = 'block';
+                    gifPlayer.style.display = 'none';
+                }};
+
+                gifPlayer.src = videoPath;
+            }} else {{
+                // Display video
+                videoPlayer.onloadedmetadata = function() {{
+                    videoDisplay.style.display = 'none';
+                    videoPlayer.style.display = 'block';
+
+                    // Set canvas size to match video
+                    canvas.width = videoPlayer.offsetWidth;
+                    canvas.height = videoPlayer.offsetHeight;
+                    canvas.style.display = 'block';
+
+                    // Draw bounding boxes
+                    drawBoundingBoxes(ctx, boundingBoxes, videoPlayer.offsetWidth, videoPlayer.offsetHeight);
+
+                    videoPlayer.play();
+                }};
+
+                videoPlayer.onerror = function() {{
+                    videoDisplay.textContent = `Failed to load video: ${{videoPath}}`;
+                    videoDisplay.style.display = 'block';
+                    videoPlayer.style.display = 'none';
+                }};
+
+                // Handle video resize during playback
+                videoPlayer.onresize = function() {{
+                    canvas.width = videoPlayer.offsetWidth;
+                    canvas.height = videoPlayer.offsetHeight;
+                    drawBoundingBoxes(ctx, boundingBoxes, videoPlayer.offsetWidth, videoPlayer.offsetHeight);
+                }};
+
+                videoPlayer.src = videoPath;
+            }}
+        }}
+
+        function drawBoundingBoxes(ctx, boundingBoxes, displayWidth, displayHeight) {{
+            if (!boundingBoxes || boundingBoxes.length === 0) {{
+                return;
+            }}
+
+            // Assume bounding boxes are in the original coordinate space
+            // We may need to scale them to match the display size
+            // For now, we'll draw them as-is and let CSS handle scaling
+
+            ctx.strokeStyle = '#00FF00';  // Green boxes
+            ctx.lineWidth = 2;
+            ctx.font = '12px Arial';
+            ctx.fillStyle = '#00FF00';
+
+            boundingBoxes.forEach((box, index) => {{
+                const x1 = box.x1;
+                const y1 = box.y1;
+                const x2 = box.x2;
+                const y2 = box.y2;
+                const width = x2 - x1;
+                const height = y2 - y1;
+
+                // Draw rectangle
+                ctx.strokeRect(x1, y1, width, height);
+
+                // Draw label if available (in exhaustive mode or always)
+                if (exhaustiveMode && box.label) {{
+                    const labelText = `Box ${{index + 1}}: ${{box.label}}`;
+                    ctx.fillText(labelText, x1, Math.max(y1 - 5, 10));
+                }}
+            }});
+
+            // In exhaustive mode, also draw coordinates as circles
+            if (exhaustiveMode) {{
+                ctx.fillStyle = '#FF0000';  // Red for coordinates
+                // Note: coordinates would come from nodeData.coords
+                // This is handled by the existing highlight canvas for the main image
+            }}
+        }}
+
         function showRolloutModal(rolloutData) {{
             currentRolloutData = rolloutData;
             currentTurn = 0;
-            
+
             const turnSelector = document.getElementById('turn-selector');
             const prompts = rolloutData.data || [];
             
@@ -1921,8 +2131,9 @@ def generate_html_file(tree_data, graph_data, stats, output_dir, output_filename
                 updatePromptDisplay(data);
                 updateExamplesDisplay(data);
                 updateOutputDisplay(data);
+                updateVideoDisplay(data);
                 drawHighlight(data.coords);
-                
+
                 // Update extended view if active
                 if (isExtendedView) {{
                     updateExtendedContent(data);
@@ -1930,6 +2141,7 @@ def generate_html_file(tree_data, graph_data, stats, output_dir, output_filename
             }} else if (data?.type === 'rollout_prompts') {{
                 showRolloutModal(data);
                 updateOutputDisplay(data);
+                updateVideoDisplay(data);
                 drawHighlight(data.coords);
             }}
         }}
@@ -2147,7 +2359,8 @@ def main():
     parser.add_argument('--output_dir', type=str, default='.', help='Directory to save the output HTML file.')
     parser.add_argument('--max_depth', type=int, default=None, help='Maximum depth of the tree to visualize.')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode to show coordinates on hover.')
-    
+    parser.add_argument('--exhaustive', action='store_true', help='Enable exhaustive mode to visualize all coordinates and bounding boxes from node outputs.')
+
     args = parser.parse_args()
 
     # Get the experiment directory from the input file path
@@ -2192,7 +2405,7 @@ def main():
     print(f"Processed {len(graph_data['nodes'])} nodes and {len(graph_data['edges'])} edges for the graph.")
 
     # 3. Generate the final HTML file
-    generate_html_file(rollout_data, graph_data, stats, args.output_dir, args.output_filename, args.debug, images_config)
+    generate_html_file(rollout_data, graph_data, stats, args.output_dir, args.output_filename, args.debug, images_config, args.exhaustive)
     print(f"✅ Enhanced interactive visualization v{VERSION} saved to {args.output_dir}/{args.output_filename}.html")
 
 if __name__ == '__main__':
