@@ -1,0 +1,32 @@
+# Test files
+test_output.html
+test_output_stats.txt
+test_visualizer.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output files from visualizer
+*_visualization_*.html
+*_stats.txt
