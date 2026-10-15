@@ -658,17 +658,34 @@ def build_graph_data(tree_data, max_depth_vis):
     edges = []
     interactive_data_map = {}
     node_id_counter = 0
+    # Deduplicated image store: maps image_key -> base64 data URL.
+    # Nodes reference images by key to avoid duplicating ~500KB blobs.
+    image_store = {}
+    _image_hash_to_key = {}  # hash(blob) -> key, for dedup
 
     root = tree_data.get('tree')
     if not root:
         return {"nodes": [], "edges": [], "interactive_data": {}}
 
-    def _recursive_build(node, parent_id, depth):
+    def _store_image(image_data):
+        """Store an image blob and return a dedup key, or None if no image."""
+        if not image_data:
+            return None
+        # Use first 128 chars as a cheap identity hash (base64 is unique enough)
+        sig = image_data[:128]
+        if sig in _image_hash_to_key:
+            return _image_hash_to_key[sig]
+        key = f"img_{len(image_store)}"
+        image_store[key] = image_data
+        _image_hash_to_key[sig] = key
+        return key
+
+    def _recursive_build(node, parent_id, depth, parent_image_key=None):
         nonlocal node_id_counter
-        
+
         current_id = f"node_{node_id_counter}"
         node_id_counter += 1
-        
+
         if max_depth_vis is not None and depth > max_depth_vis:
             return
 
@@ -678,10 +695,21 @@ def build_graph_data(tree_data, max_depth_vis):
         value = node.get('value', 0.0)
         is_terminal = node.get('is_terminal', False)
 
-        # Determine node type for better visualization
+        # Determine per-node image: action nodes have their own screenshot,
+        # think nodes inherit their parent's image.  Store via dedup key.
+        node_image = node.get('image')  # Action nodes have this as a data URL
+        effective_image_key = _store_image(node_image) if node_image else parent_image_key
+
+        # Determine node type using the node_type field (new format),
+        # falling back to text-based heuristics (old format)
+        node_type_field = node.get('node_type', '')
         node_type = "Unknown"
         if parent_id is None:
             node_type = "Root"
+        elif node_type_field == "think":
+            node_type = "Thinking"
+        elif node_type_field == "action":
+            node_type = "Action"
         elif thought.startswith('<think>'):
             node_type = "Thinking"
         elif thought.startswith('click') or thought.startswith('scroll') or thought.startswith('go_back') or thought.startswith('stop'):
@@ -706,8 +734,16 @@ def build_graph_data(tree_data, max_depth_vis):
         else:
             color = '#97C2FC'  # Default blue
         
-        coords = _extract_coords(thought)
-        
+        # Prefer used_coords (canonical, what was sent to browser) when present;
+        # fall back to extracting from thought_text for old format.
+        used_coords_raw = node.get('used_coords') or []
+        if used_coords_raw:
+            coords = []
+            for coord_str in used_coords_raw:
+                coords.extend(_extract_coords(coord_str))
+        else:
+            coords = _extract_coords(thought)
+
         nodes.append({
             "id": current_id, "label": label, "shape": 'box', "color": color,
             "margin": 10, "font": {"color": "#333"}
@@ -804,13 +840,22 @@ def build_graph_data(tree_data, max_depth_vis):
                                 'source': 'ephemeral_paths'
                             })
         
+        # Store a flat copy of node data (exclude children, past_screenshots, and
+        # image to avoid massive HTML bloat from embedded base64 data —
+        # the image is accessible via node_image_key in the separate image store)
+        node_data_flat = {k: v for k, v in node.items() if k not in ('children', 'past_screenshots', 'image')}
+
         interactive_data_map[current_id] = {
-            "type": "node_prompt", 
+            "type": "node_prompt",
             "data": prompt_for_node,
             "coords": coords,
             "node_type": node_type,
-            "node_data": node,
-            "retrieved_examples": retrieved_examples
+            "node_data": node_data_flat,
+            "retrieved_examples": retrieved_examples,
+            "node_image_key": effective_image_key,
+            "browser_url": node.get('browser_url'),
+            "accumulated_thoughts": node.get('accumulated_thoughts', []),
+            "accumulated_action_descriptions": node.get('accumulated_action_descriptions', []),
         }
         
         # 3. Create a SEPARATE leaf node for EACH rollout
@@ -848,16 +893,17 @@ def build_graph_data(tree_data, max_depth_vis):
                     "type": "rollout_prompts",
                     "data": rollout.get('rollout_prompts', []),
                     "coords": rollout_coords,
-                    "rollout_data": rollout
+                    "rollout_data": rollout,
+                    "node_image_key": effective_image_key,
                 }
 
-        # 4. Recurse for children
+        # 4. Recurse for children, propagating the effective image key
         for child in node.get('children', []):
-            _recursive_build(child, current_id, depth + 1)
+            _recursive_build(child, current_id, depth + 1, parent_image_key=effective_image_key)
 
-    _recursive_build(root, None, 0)
+    _recursive_build(root, None, 0, parent_image_key=None)
     
-    return {"nodes": nodes, "edges": edges, "interactive_data": interactive_data_map}
+    return {"nodes": nodes, "edges": edges, "interactive_data": interactive_data_map, "image_store": image_store}
 
 
 def encode_image_to_base64(image_path):
@@ -865,6 +911,10 @@ def encode_image_to_base64(image_path):
     if not image_path or not isinstance(image_path, str):
         return None
     
+    # Check if it's already a data URL (e.g. from multiturn MCTS per-node screenshots)
+    if image_path.startswith('data:'):
+        return image_path  # Already a data URL
+
     # Check if it's a URL - don't try to encode URLs
     if image_path.startswith(('http://', 'https://')):
         print(f"Skipping URL image (will display directly): {image_path}")
@@ -911,6 +961,7 @@ def generate_html_file(tree_data, graph_data, stats, output_filename, debug_mode
     nodes_json = json.dumps(graph_data['nodes'])
     edges_json = json.dumps(graph_data['edges'])
     interactive_data_json = json.dumps(graph_data['interactive_data'])
+    image_store_json = json.dumps(graph_data.get('image_store', {}))
     debug_mode_json = json.dumps(debug_mode)
     
     # Calculate display scale from images config
@@ -963,6 +1014,8 @@ def generate_html_file(tree_data, graph_data, stats, output_filename, debug_mode
     else:
         print(f"Warning: Could not encode image, using original path: {image_path}")
         display_image_src = image_path
+
+    default_image_src_json = json.dumps(display_image_src)
 
     html_template = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1374,8 +1427,10 @@ def generate_html_file(tree_data, graph_data, stats, output_filename, debug_mode
         const nodesData = {nodes_json};
         const edgesData = {edges_json};
         const interactiveDataMap = {interactive_data_json};
+        const imageStore = {image_store_json};
         const debugMode = {debug_mode_json};
         const displayScale = {display_scale_json};
+        const defaultImageSrc = {default_image_src_json};
 
         // --- State Variables ---
         let currentSelectedNode = null;
@@ -1385,6 +1440,7 @@ def generate_html_file(tree_data, graph_data, stats, output_filename, debug_mode
         let currentTurn = 0;
         let isExtendedView = false;
         let currentExtendedTab = null;
+        let currentNodeImageSrc = null;
 
         // --- DOM Elements ---
         const leftPanelContainer = document.getElementById('left-panel-container');
@@ -1527,21 +1583,51 @@ def generate_html_file(tree_data, graph_data, stats, output_filename, debug_mode
             console.log(`Applied display scale: ${{displayScale}}, effective size: ${{effectiveWidth}}x${{effectiveHeight}}, natural size: ${{taskImage.naturalWidth}}x${{taskImage.naturalHeight}}`);
         }}
 
+        function switchNodeImage(imageKey, coordsList) {{
+            // Resolve image key to actual data URL from the deduplicated store
+            const newSrc = (imageKey && imageStore[imageKey]) ? imageStore[imageKey] : defaultImageSrc;
+            if (newSrc === currentNodeImageSrc) {{
+                drawHighlight(coordsList);
+                return;
+            }}
+            currentNodeImageSrc = newSrc;
+            taskImage.onload = function() {{
+                fitImageToContainer();
+                drawHighlight(coordsList);
+            }};
+            taskImage.src = newSrc;
+            taskImage.style.display = 'block';
+            dropZone.classList.add('hidden');
+        }}
+
         function drawHighlight(coordsList) {{
             if (!coordsList || coordsList.length === 0 || !taskImage.complete || taskImage.naturalWidth === 0) {{
                 ctx.clearRect(0, 0, highlightCanvas.width, highlightCanvas.height);
                 return;
             }}
-            
+
+            const effectiveWidth = taskImage.naturalWidth * displayScale;
+            const effectiveHeight = taskImage.naturalHeight * displayScale;
+
+            // Convert normalized coords (0-1 range) to pixel coords
+            const pixelCoords = coordsList.map(coords => {{
+                let [x, y] = coords;
+                if (x <= 1.0 && y <= 1.0) {{
+                    x = x * effectiveWidth;
+                    y = y * effectiveHeight;
+                }}
+                return [x, y];
+            }});
+
             const radius = 50;
 
             ctx.clearRect(0, 0, highlightCanvas.width, highlightCanvas.height);
             ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
             ctx.fillRect(0, 0, highlightCanvas.width, highlightCanvas.height);
-            
+
             ctx.globalCompositeOperation = 'destination-out';
-            
-            coordsList.forEach(coords => {{
+
+            pixelCoords.forEach(coords => {{
                 const [x, y] = coords;
                 ctx.beginPath();
                 ctx.arc(x, y, radius, 0, 2 * Math.PI);
@@ -1747,14 +1833,31 @@ def generate_html_file(tree_data, graph_data, stats, output_filename, debug_mode
                 output += `Visit Count: ${{node.visit_count || 0}}\\n`;
                 output += `Value: ${{node.value || 0}}\\n`;
                 output += `Coordinates: ${{nodeData.coords ? nodeData.coords.join(', ') : 'None'}}\\n`;
-                
+
+                if (nodeData.browser_url) {{
+                    output += `URL: ${{nodeData.browser_url}}\\n`;
+                }}
+
+                if (nodeData.accumulated_action_descriptions && nodeData.accumulated_action_descriptions.length > 0) {{
+                    output += `\\nAction History (${{nodeData.accumulated_action_descriptions.length}} actions):\\n`;
+                    nodeData.accumulated_action_descriptions.forEach((desc, i) => {{
+                        output += `  ${{i+1}}. ${{desc}}\\n`;
+                    }});
+                }}
+                if (nodeData.accumulated_thoughts && nodeData.accumulated_thoughts.length > 0) {{
+                    output += `\\nThought History (${{nodeData.accumulated_thoughts.length}}):\\n`;
+                    nodeData.accumulated_thoughts.forEach((thought, i) => {{
+                        output += `  ${{i+1}}. ${{thought}}\\n`;
+                    }});
+                }}
+
                 if (node.rollouts && node.rollouts.length > 0) {{
                     output += `\\nRollouts (${{node.rollouts.length}}):\\n`;
                     node.rollouts.forEach((rollout, i) => {{
                         output += `  Rollout ${{i+1}}: ${{rollout.final_answer}} (Reward: ${{rollout.reward}})\\n`;
                     }});
                 }}
-                
+
                 displayElement.textContent = output;
             }} else if (nodeData.type === 'rollout_prompts') {{
                 const rollout = nodeData.rollout_data;
@@ -1956,8 +2059,8 @@ def generate_html_file(tree_data, graph_data, stats, output_filename, debug_mode
                 updatePromptDisplay(data);
                 updateExamplesDisplay(data);
                 updateOutputDisplay(data);
-                drawHighlight(data.coords);
-                
+                switchNodeImage(data.node_image_key, data.coords);
+
                 // Update extended view if active
                 if (isExtendedView) {{
                     updateExtendedContent(data);
@@ -1965,7 +2068,7 @@ def generate_html_file(tree_data, graph_data, stats, output_filename, debug_mode
             }} else if (data?.type === 'rollout_prompts') {{
                 showRolloutModal(data);
                 updateOutputDisplay(data);
-                drawHighlight(data.coords);
+                switchNodeImage(data.node_image_key, data.coords);
             }}
         }}
 
